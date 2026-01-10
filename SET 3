@@ -1,0 +1,346 @@
+# ==============================================================================
+# RASPBERRY PI 5 FIELD MANUAL - PART 3: INDUSTRIAL & RESILIENCE (141-180)
+# Focus: Modbus, Control Math, Systemd, Crash Handling
+# ==============================================================================
+
+import time
+import struct
+import math
+import sys
+import os
+import signal
+import subprocess
+import gzip
+import traceback
+from collections import deque
+
+# ==============================================================================
+# SECTION 14: INDUSTRIAL SERIAL & PROTOCOLS (141-150)
+# Goal: Talk to VFDs (Delta MS300) and ensure data integrity.
+# ==============================================================================
+
+# 141. Modbus CRC16 Calculation (Crucial for VFDs)
+# The standard checksum used by Delta MS300/Industrial gear.
+def modbus_crc(data: bytes) -> bytes:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 1:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    # Returns Low Byte, High Byte (Little Endian)
+    return struct.pack('<H', crc)
+
+# 142. Constructing a Modbus RTU Packet
+# Example: Read Status (Func 03) from Slave 1, Reg 0x2000, 1 Word
+def build_modbus_read(slave_id, reg_addr, count):
+    # ID, Func, RegHi, RegLo, CntHi, CntLo
+    payload = struct.pack('>BBHH', slave_id, 3, reg_addr, count)
+    crc = modbus_crc(payload)
+    return payload + crc
+
+# 143. COBS Encoding (Consistent Overhead Byte Stuffing)
+# The industry standard for framing binary data without using a newline.
+# Removes all 0x00 bytes from payload so 0x00 can be used as Packet Delimiter.
+def cobs_encode(data):
+    out = bytearray()
+    idx = 0
+    # (Simplified implementation logic would go here)
+    # Use library: pip install cobs
+    # from cobs import cobs
+    # return cobs.encode(data) + b'\x00'
+    pass
+
+# 144. Fixed-Length Packet Parser
+# If VFD sends exactly 8 bytes every time, don't use readline.
+def read_fixed_packet(ser, length=8):
+    if ser.in_waiting >= length:
+        return ser.read(length)
+    return None
+
+# 145. The "Spy" Mode (Passthrough)
+# Use Pi as a Man-in-the-Middle sniffer between PC and VFD.
+def serial_passthrough(src, dst):
+    if src.in_waiting:
+        byte = src.read()
+        dst.write(byte)
+        # Log it too
+        print(f"[{src.name}]: {byte.hex()}")
+
+# 146. High-Precision Timestamping (Telemetry)
+# Standard time.time() is float. Use ns for logs.
+timestamp_ns = time.time_ns() 
+
+# 147. Serial "Break" Signal
+# Sometimes needed to reset legacy microcontrollers.
+def send_break(ser):
+    ser.send_break(duration=0.25)
+
+# 148. Detecting Serial Disconnect (IOError)
+# Handling the "Device removed" event gracefully.
+try:
+    ser.write(b'ping')
+except OSError as e:
+    if "Input/output error" in str(e):
+        print("CABLE UNPLUGGED!")
+        # Trigger reconnection logic
+
+# 149. Virtual Serial Port (For Unit Testing)
+# Create a fake serial port to test logic without hardware.
+# Run in shell: `socat -d -d pty,raw,echo=0 pty,raw,echo=0`
+# Python: ser = serial.Serial('/dev/pts/3', ...)
+
+# 150. Latency Ping (Round-Trip Time)
+def measure_rtt():
+    start = time.perf_counter()
+    ser.write(b'PING')
+    # Wait for response (blocking for test)
+    ser.read(4) 
+    end = time.perf_counter()
+    return (end - start) * 1000 # ms
+
+
+# ==============================================================================
+# SECTION 15: CONTROL LOGIC & MATH (151-160)
+# Goal: Smooth out noisy sensors and prevent jerky motor moves.
+# ==============================================================================
+
+# 151. Slew Rate Limiter (Soft Start)
+# Prevents motor from jumping 0->100% instantly (saves gears).
+current_out = 0.0
+def slew_limit(target, max_change):
+    global current_out
+    change = target - current_out
+    # Clamp change to +/- max_change
+    if change > max_change: change = max_change
+    if change < -max_change: change = -max_change
+    current_out += change
+    return current_out
+
+# 152. Map Function (Arduino Style)
+def map_range(x, in_min, in_max, out_min, out_max):
+    return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+# 153. Clamp / Constrain
+def clamp(n, minn, maxn):
+    return max(min(maxn, n), minn)
+
+# 154. Deadband Filter
+# Ignore joystick drift near center.
+def deadband(val, threshold=0.05):
+    if abs(val) < threshold: return 0.0
+    return val
+
+# 155. Exponential Moving Average (EMA)
+# Very fast Low-Pass Filter. Alpha 0.1 = Slow, 0.9 = Fast.
+ema_val = 0
+def update_ema(new_sample, alpha=0.2):
+    global ema_val
+    ema_val = (alpha * new_sample) + ((1 - alpha) * ema_val)
+    return ema_val
+
+# 156. Derivator (Rate of Change)
+# Good for detecting "Sudden Impact" (Crash).
+prev_val = 0
+def get_rate(new_val, dt):
+    global prev_val
+    rate = (new_val - prev_val) / dt
+    prev_val = new_val
+    return rate
+
+# 157. Wrapping Angle (0-360 deg)
+# Handles the jump from 359 to 0.
+def diff_angle(a, b):
+    d = a - b
+    while d > 180: d -= 360
+    while d <= -180: d += 360
+    return d
+
+# 158. Tank Drive Mixing (Steering)
+# Convert Throttle/Steering to Left/Right Motor.
+def arcade_drive(throttle, turn):
+    left = throttle + turn
+    right = throttle - turn
+    return clamp(left, -1, 1), clamp(right, -1, 1)
+
+# 159. Hysteresis Switch (Thermostat Logic)
+# Prevents rapid toggling at threshold.
+fan_on = False
+def update_fan(temp):
+    global fan_on
+    if temp > 60: fan_on = True
+    if temp < 55: fan_on = False
+    return fan_on
+
+# 160. Simple Integral Windup Guard
+# Prevents PID I-term from growing infinitely.
+i_term += error * dt
+i_term = clamp(i_term, -100, 100) # Hard limit
+
+
+# ==============================================================================
+# SECTION 16: SYSTEM RESILIENCE & LINUX OPS (161-170)
+# Goal: Make the Pi survive 24/7 operation without supervision.
+# ==============================================================================
+
+# 161. Creating a Systemd Service (Template)
+# Save as: /etc/systemd/system/robot.service
+"""
+[Unit]
+Description=Robot Control Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/main.py
+Restart=always
+RestartSec=5
+User=pi
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# 162. Performance Governor (Force CPU Max Speed)
+# Prevents latency spikes when CPU wakes from idle.
+def set_performance_mode():
+    os.system("echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
+
+# 163. Read-Only Filesystem Check
+# Detect if SD card locked up (common Pi failure).
+def is_readonly():
+    try:
+        with open('test_write', 'w') as f: f.write('x')
+        os.remove('test_write')
+        return False
+    except OSError:
+        return True
+
+# 164. "Black Box" Crash Logger
+# Captures the stack trace to a file before dying.
+def install_crash_handler():
+    def handler(exctype, value, tb):
+        with open("crash.log", "a") as f:
+            f.write(f"\nCRASH: {time.ctime()}\n")
+            traceback.print_exception(exctype, value, tb, file=f)
+    sys.excepthook = handler
+
+# 165. Disable WiFi Power Save
+# WiFi sleep causes massive latency spikes (100ms+).
+# Run on boot: `sudo iw wlan0 set power_save off`
+
+# 166. Log Rotation & Compression (Gzip)
+# Compress old logs to save space.
+def compress_log(filename):
+    with open(filename, 'rb') as f_in:
+        with gzip.open(f'{filename}.gz', 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    os.remove(filename)
+
+# 167. Auto-Restart Node-RED (Integration)
+# If your Python script detects Node-RED failure.
+def restart_nodered():
+    os.system("sudo systemctl restart nodered")
+
+# 168. Check Memory Usage (Leak detection)
+import psutil # pip install psutil
+def check_ram():
+    process = psutil.Process(os.getpid())
+    mb = process.memory_info().rss / 1024 / 1024
+    if mb > 200: print("Memory Leak Detected!")
+
+# 169. Identify Pi Model Programmatically
+def get_pi_model():
+    # Reads /proc/device-tree/model
+    try:
+        with open('/proc/device-tree/model') as f:
+            return f.read().strip() # e.g. "Raspberry Pi 5 Model B Rev 1.0"
+    except: return "Unknown"
+
+# 170. Force Hardware Reset (via Header)
+# Pi 5 has a 'RUN' header. Shorting it resets CPU.
+# Use an external watchdog (Arduino) to pull this pin LOW if Pi freezes.
+
+
+# ==============================================================================
+# SECTION 17: ADVANCED INTEGRATION & IPC (171-180)
+# Goal: Connecting Python to C++, Dashboards, and Configs.
+# ==============================================================================
+
+# 171. ZeroMQ (ZMQ) - Professional IPC
+# Better than sockets. Connects scripts efficiently.
+# pip install pyzmq
+"""
+import zmq
+context = zmq.Context()
+socket = context.socket(zmq.PUB)
+socket.bind("tcp://*:5555")
+socket.send_string("Telemetry Data...")
+"""
+
+# 172. Shared Memory Dictionary (multiprocessing)
+# Thread-safe config store across processes.
+from multiprocessing import Manager
+# manager = Manager()
+# shared_config = manager.dict()
+# shared_config['speed'] = 50
+
+# 173. The "Strategy Pattern" (Hot-Swappable Logic)
+# Switch algorithms on the fly.
+def algo_aggressive(x): return x * 2
+def algo_conservative(x): return x * 0.5
+
+current_strategy = algo_aggressive
+# In loop: output = current_strategy(input)
+
+# 174. UDP Broadcast (Discovery)
+# Find your Pi's IP automatically from your Laptop.
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+# sock.sendto(b"I_AM_HERE", ('<broadcast>', 9999))
+
+# 175. Git Pull Update (Self-Updating Robot)
+def self_update():
+    print("Pulling updates...")
+    subprocess.run(["git", "pull"])
+    print("Restarting...")
+    os.execv(sys.executable, ['python'] + sys.argv)
+
+# 176. Loading Calibration from File (Matrix)
+# Good for IMU calibration data.
+import numpy as np
+def load_calib():
+    # Load 3x3 matrix and 3x1 offset
+    return np.loadtxt("calib_matrix.txt")
+
+# 177. Heartbeat LED Pattern (Threaded)
+# different blink speeds for different states.
+def heartbeat_thread(state_obj):
+    while True:
+        if state_obj.value == 0: # IDLE
+            led.blink(1, 1)
+        elif state_obj.value == 1: # ARMED
+            led.blink(0.1, 0.1)
+        time.sleep(2)
+
+# 178. Remote Shell (Dangerous but useful)
+# Execute Python commands sent over serial.
+# Use carefully!
+# exec(received_string)
+
+# 179. Detect HDMI Display
+# Change behavior if screen is attached vs Headless.
+def is_display_connected():
+    status = subprocess.getoutput("tvservice -s")
+    return "0x120002" not in status # Check for specific 'off' code
+
+# 180. The "Main Guard" (Boilerplate)
+# Ensures code doesn't run when imported as a module.
+if __name__ == '__main__':
+    try:
+        setup()
+        main_loop()
+    except KeyboardInterrupt:
+        cleanup()
