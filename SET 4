@@ -1,0 +1,484 @@
+# ==============================================================================
+# RASPBERRY PI 5 FIELD MANUAL - PART 4: MODULAR ARCHITECTURE (181-200)
+# Focus: Drop-in Classes for Serial, Logging, Control, and Safety
+# ==============================================================================
+
+import time
+import serial
+import csv
+import json
+import threading
+import queue
+import struct
+import os
+from collections import deque
+
+# ==============================================================================
+# SECTION 18: THE "COMMUNICATIONS" MODULES (181-185)
+# Goal: Bulletproof Serial Handling. Never crash on disconnect.
+# ==============================================================================
+
+# 181. The "RobustSerial" Class (The Ultimate UART Wrapper)
+# Handles: Auto-Reconnection, Threading, Buffering, Line Parsing
+class RobustSerial:
+    def __init__(self, port, baud=9600):
+        self.port = port
+        self.baud = baud
+        self.ser = None
+        self.running = True
+        self.rx_queue = queue.Queue()
+        self.tx_queue = queue.Queue()
+        
+        # Start background thread
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def send(self, data_str):
+        """Public API: Send a string (non-blocking)"""
+        self.tx_queue.put(data_str)
+
+    def read_line(self):
+        """Public API: Get latest line or None"""
+        try:
+            return self.rx_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def _worker(self):
+        while self.running:
+            # 1. Connect
+            if self.ser is None:
+                try:
+                    self.ser = serial.Serial(self.port, self.baud, timeout=1)
+                    print(f"[Serial] Connected to {self.port}")
+                except serial.SerialException:
+                    time.sleep(1) # Wait before retry
+                    continue
+
+            # 2. IO Loop
+            try:
+                # Read
+                if self.ser.in_waiting:
+                    line = self.ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line: self.rx_queue.put(line)
+                
+                # Write
+                while not self.tx_queue.empty():
+                    msg = self.tx_queue.get_nowait()
+                    self.ser.write(f"{msg}\n".encode())
+                    
+            except (serial.SerialException, OSError):
+                print("[Serial] Connection Lost!")
+                self.ser.close()
+                self.ser = None # Trigger reconnect logic
+
+# 182. CSV-Over-UART Parser (Incoming)
+# Parses strings like: "START, 12.5, 0.05, 100, END" safely
+class CSVParser:
+    def __init__(self, expected_columns=3):
+        self.cols = expected_columns
+
+    def parse(self, raw_string):
+        """Returns list of floats or None if invalid"""
+        if not raw_string: return None
+        
+        # Remove whitespace and split
+        parts = [p.strip() for p in raw_string.split(',')]
+        
+        # Validation 1: Length check
+        if len(parts) != self.cols:
+            return None
+            
+        # Validation 2: Type conversion
+        try:
+            return [float(x) for x in parts]
+        except ValueError:
+            return None # Contains non-numbers
+
+# 183. CSV-Over-UART Sender (Outgoing)
+# Formats data efficiently: "12.50,0.05,100"
+def format_csv_packet(*args):
+    """
+    Usage: packet = format_csv_packet(temp, pressure, status)
+    Output: "25.40,1013.2,1"
+    """
+    # Use f-string formatting for precision control
+    # .2f = 2 decimal places (saves bandwidth)
+    formatted = [f"{x:.2f}" if isinstance(x, float) else str(x) for x in args]
+    return ",".join(formatted)
+
+# 184. Binary Telemetry Packer (Struct Class)
+# For high-speed UAV data (10x faster than CSV)
+class TelemetryPacker:
+    def __init__(self):
+        # Format: Start(BB), 3 Floats(fff), Status(i), End(BB)
+        self.fmt = '<BBfffiBB' 
+        self.start_byte = 0xAA
+        self.end_byte = 0x55
+
+    def pack(self, roll, pitch, yaw, status):
+        return struct.pack(self.fmt, 
+                           self.start_byte, self.start_byte,
+                           roll, pitch, yaw, status,
+                           self.end_byte, self.end_byte)
+
+    def unpack(self, data_bytes):
+        try:
+            unpacked = struct.unpack(self.fmt, data_bytes)
+            # Return just the data (strip headers)
+            return unpacked[2:6] 
+        except struct.error:
+            return None
+
+# 185. The "Message Bus" (Internal Pub/Sub)
+# Decouples your modules. "Sensor" doesn't need to know "Logger" exists.
+class MessageBus:
+    def __init__(self):
+        self.subscribers = {}
+
+    def subscribe(self, topic, callback):
+        if topic not in self.subscribers:
+            self.subscribers[topic] = []
+        self.subscribers[topic].append(callback)
+
+    def publish(self, topic, data):
+        if topic in self.subscribers:
+            for callback in self.subscribers[topic]:
+                callback(data)
+
+# Usage:
+# bus = MessageBus()
+# bus.subscribe("IMU", my_logger.log)
+# bus.publish("IMU", {"accel": 0.5})
+
+
+# ==============================================================================
+# SECTION 19: THE "DATA HANDLER" MODULES (186-190)
+# Goal: Saving data without blocking the CPU.
+# ==============================================================================
+
+# 186. Threaded CSV Logger (Non-Blocking)
+# The industry standard way to log data.
+class AsyncLogger:
+    def __init__(self, filename="flight_log.csv"):
+        self.queue = queue.Queue()
+        self.filename = filename
+        self.thread = threading.Thread(target=self._write_loop, daemon=True)
+        self.thread.start()
+
+    def log(self, data_list):
+        """Call this from your high-speed loop"""
+        # Add timestamp automatically
+        self.queue.put([time.time()] + data_list)
+
+    def _write_loop(self):
+        with open(self.filename, 'a', newline='') as f:
+            writer = csv.writer(f)
+            while True:
+                data = self.queue.get()
+                writer.writerow(data)
+                self.queue.task_done()
+                f.flush() # Ensure data hits disk
+
+# 187. Config Manager (JSON with Auto-Reload)
+# Load settings once. Reload if file changes? Optional.
+class Config:
+    def __init__(self, path="config.json"):
+        self.path = path
+        self.data = self._load()
+    
+    def _load(self):
+        defaults = {"pid": {"p": 1.0, "i": 0.0, "d": 0.0}, "loop_hz": 100}
+        if not os.path.exists(self.path):
+            with open(self.path, 'w') as f: json.dump(defaults, f, indent=4)
+            return defaults
+        try:
+            with open(self.path, 'r') as f: return json.load(f)
+        except:
+            return defaults
+
+    def get(self, key, subkey=None):
+        """Safe getter. usage: cfg.get('pid', 'p')"""
+        try:
+            if subkey: return self.data[key][subkey]
+            return self.data[key]
+        except KeyError:
+            return 0 # Safe default
+
+# 188. Ring Buffer (Moving History)
+# Keep last N samples (for averaging or crash dumps)
+class HistoryBuffer:
+    def __init__(self, size=100):
+        self.buffer = deque(maxlen=size)
+    
+    def add(self, val):
+        self.buffer.append(val)
+        
+    def get_average(self):
+        if not self.buffer: return 0
+        return sum(self.buffer) / len(self.buffer)
+        
+    def dump_to_file(self, filename):
+        with open(filename, 'w') as f:
+            for item in self.buffer:
+                f.write(f"{item}\n")
+
+# 189. Signal Filter Module (Low Pass)
+# Smooth out jittery sensor data.
+class LowPassFilter:
+    def __init__(self, alpha=0.1):
+        self.alpha = alpha
+        self.prev = None
+
+    def update(self, val):
+        if self.prev is None:
+            self.prev = val
+            return val
+        
+        filtered = (self.alpha * val) + ((1.0 - self.alpha) * self.prev)
+        self.prev = filtered
+        return filtered
+
+# 190. Rate Limiter (For Logs/Prints)
+# "Print this error only once per second"
+class RateLimiter:
+    def __init__(self, interval_sec):
+        self.interval = interval_sec
+        self.last_time = 0
+
+    def ready(self):
+        now = time.monotonic()
+        if now - self.last_time > self.interval:
+            self.last_time = now
+            return True
+        return False
+
+# Usage:
+# limit = RateLimiter(1.0)
+# if limit.ready(): print("Still alive...")
+
+
+# ==============================================================================
+# SECTION 20: THE "CONTROL & SAFETY" MODULES (191-200)
+# Goal: Reusable logic for Robots/UAVs.
+# ==============================================================================
+
+# 191. PID Controller Class (The Real Deal)
+# Includes Integral Windup Guard and Output Clamping.
+class PID:
+    def __init__(self, kp, ki, kd, out_min=-1, out_max=1):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.min, self.max = out_min, out_max
+        self.integral = 0
+        self.prev_err = 0
+
+    def compute(self, setpoint, actual, dt):
+        err = setpoint - actual
+        
+        # P Term
+        p_out = self.kp * err
+        
+        # I Term (with clamp)
+        self.integral += err * dt
+        # Anti-windup: Stop integrating if we are maxed out
+        i_out = self.ki * self.integral
+        
+        # D Term
+        derivative = (err - self.prev_err) / dt
+        d_out = self.kd * derivative
+        
+        self.prev_err = err
+        
+        # Sum and Clamp
+        output = p_out + i_out + d_out
+        return max(min(output, self.max), self.min)
+
+# 192. Task Scheduler (Pseudo-RTOS)
+# Clean way to run 100Hz, 10Hz, 1Hz loops.
+class TaskScheduler:
+    def __init__(self, main_freq_hz=100):
+        self.period = 1.0 / main_freq_hz
+        self.tasks = []
+        self.tick = 0
+
+    def add_task(self, func, divider):
+        """Run 'func' every 'divider' ticks"""
+        self.tasks.append({"func": func, "div": divider})
+
+    def run(self):
+        # Master Loop
+        start = time.monotonic()
+        
+        for task in self.tasks:
+            if self.tick % task['div'] == 0:
+                task['func']()
+        
+        self.tick += 1
+        
+        # Sleep remainder
+        elapsed = time.monotonic() - start
+        sleep_time = self.period - elapsed
+        if sleep_time > 0: time.sleep(sleep_time)
+
+# 193. Simple State Machine (Class Based)
+class StateMachine:
+    def __init__(self):
+        self.state = "IDLE"
+        self.handlers = {}
+
+    def add_state(self, name, handler_func):
+        self.handlers[name] = handler_func
+
+    def set_state(self, new_state):
+        if new_state in self.handlers:
+            print(f"[FSM] {self.state} -> {new_state}")
+            self.state = new_state
+            
+    def update(self):
+        if self.state in self.handlers:
+            # Execute current state logic
+            self.handlers[self.state]()
+
+# 194. Watchdog Timer (Software)
+# If feed() isn't called for X seconds, trigger callback (e.g., land drone).
+class Watchdog:
+    def __init__(self, timeout, callback):
+        self.timeout = timeout
+        self.cb = callback
+        self.last_feed = time.time()
+        
+    def feed(self):
+        self.last_feed = time.time()
+        
+    def check(self):
+        if time.time() - self.last_feed > self.timeout:
+            self.cb() # Trigger failsafe
+
+# 195. Math Utils (Static Module)
+# Common robotics functions.
+class MathUtils:
+    @staticmethod
+    def map_range(x, in_min, in_max, out_min, out_max):
+        return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min
+
+    @staticmethod
+    def deadband(value, threshold):
+        if abs(value) < threshold: return 0
+        return value
+
+    @staticmethod
+    def constrain(val, min_val, max_val):
+        return max(min(val, max_val), min_val)
+
+# 196. Button Manager (Debounce + Click)
+# Handles messy physical buttons.
+class ButtonHandler:
+    def __init__(self, pin_obj):
+        self.btn = pin_obj # gpiozero Button
+        self.btn.when_pressed = self._press
+        self.btn.when_released = self._release
+        self.last_press = 0
+        self.callback = None
+
+    def _press(self):
+        self.last_press = time.time()
+
+    def _release(self):
+        duration = time.time() - self.last_press
+        if duration < 0.05: return # Debounce junk
+        if self.callback:
+            if duration > 1.0: self.callback("LONG")
+            else: self.callback("SHORT")
+
+    def set_callback(self, func):
+        self.callback = func
+
+# 197. Performance Monitor (CPU & Loop Time)
+# Check if your code is running too slow.
+class PerfMonitor:
+    def __init__(self):
+        self.start = time.monotonic()
+        self.max_dt = 0
+    
+    def mark_start(self):
+        self.start = time.monotonic()
+        
+    def mark_end(self):
+        dt = time.monotonic() - self.start
+        if dt > self.max_dt: self.max_dt = dt
+        return dt # Returns execution time in seconds
+
+# 198. CLI Parser (Serial Command Line)
+# Simple way to type commands: "SET PID 1.0 0.1 0"
+class CLI:
+    def __init__(self):
+        self.commands = {}
+        
+    def register(self, cmd_name, func):
+        self.commands[cmd_name] = func
+        
+    def parse_input(self, line):
+        parts = line.strip().upper().split()
+        if not parts: return
+        
+        cmd = parts[0]
+        args = parts[1:]
+        
+        if cmd in self.commands:
+            try:
+                self.commands[cmd](args)
+            except Exception as e:
+                print(f"CMD Error: {e}")
+        else:
+            print("Unknown Command")
+
+# 199. Motor Interface (Abstract Base)
+# Swap between different motor drivers easily.
+class MotorDriver:
+    def set_speed(self, val):
+        raise NotImplementedError("Subclass must implement this")
+
+class L298N(MotorDriver):
+    def set_speed(self, val):
+        # Specific GPIO logic for L298N
+        pass
+
+class ESC(MotorDriver):
+    def set_speed(self, val):
+        # Specific PWM logic for Drone ESC
+        pass
+
+# 200. The "Master" Main Template
+# How to use all of the above together.
+if __name__ == "__main__":
+    # 1. Setup Modules
+    cfg = Config()
+    log = AsyncLogger()
+    ser = RobustSerial("/dev/ttyAMA0")
+    pid = PID(cfg.get('pid','p'), cfg.get('pid','i'), 0)
+    sched = TaskScheduler(100) # 100Hz
+
+    # 2. Define Tasks
+    def control_loop():
+        # Read
+        line = ser.read_line()
+        if line:
+            # Parse CSV
+            data = CSVParser(3).parse(line)
+            if data:
+                # Control
+                out = pid.compute(0, data[0], 0.01)
+                # Log
+                log.log([data[0], out])
+    
+    def heartbeat():
+        print("Alive...")
+
+    # 3. Schedule
+    sched.add_task(control_loop, 1) # Every tick (100Hz)
+    sched.add_task(heartbeat, 100)  # Every 100 ticks (1Hz)
+
+    # 4. Run
+    print("System Started.")
+    while True:
+        sched.run()
