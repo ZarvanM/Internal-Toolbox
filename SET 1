@@ -1,0 +1,487 @@
+# ==============================================================================
+# RASPBERRY PI 5 SYSTEMS ENGINEERING FIELD MANUAL - MASTER REFERENCE (1-100)
+# Libraries Required: gpiozero, pyserial, smbus2, sdnotify, paho-mqtt
+# ==============================================================================
+
+import time
+import signal
+import sys
+import os
+import subprocess
+import socket
+import threading
+import queue
+import json
+import struct
+import shutil
+import csv
+import logging
+import configparser
+from logging.handlers import RotatingFileHandler
+from concurrent.futures import ThreadPoolExecutor
+from multiprocessing import Process, Queue
+from pathlib import Path
+
+# Hardware Libraries
+# pip install gpiozero pyserial smbus2
+from gpiozero import LED, Button, PWMLED, OutputDevice, Motor, CPUTemperature, PWMOutputDevice
+import serial
+from smbus2 import SMBus
+
+# ==============================================================================
+# SECTION 1: BASIC GPIO (gpiozero) - Examples 1-10
+# ==============================================================================
+
+# 1. Basic LED Control
+led = LED(17)
+led.on()  
+led.off()
+
+# 2. Toggling State
+# Great for status indicators
+if led.is_active: led.off()
+else: led.on()
+# Or: led.toggle()
+
+# 3. Basic Button Input (Polling)
+btn = Button(2) # Defaults to Pull-Up
+if btn.is_pressed:
+    print("Button is down!")
+
+# 4. Event-Driven Button (Non-Blocking)
+def say_hello(): print("Pressed!")
+btn.when_pressed = say_hello
+
+# 5. PWM LED (Dimming)
+pwm_led = PWMLED(17)
+pwm_led.value = 0.5  # 50% brightness
+
+# 6. Breathing LED (Background Task)
+# Pulses 0-100% continuously
+pwm_led.pulse(fade_in_time=1, fade_out_time=1)
+
+# 7. Relay Control (Active Low Logic)
+# active_high=False means .on() sends 0V
+relay = OutputDevice(27, active_high=False, initial_value=False)
+relay.on() 
+
+# 8. Shutdown Button (Long Press)
+btn.hold_time = 2.0
+def shutdown(): subprocess.check_call(['sudo', 'poweroff'])
+btn.when_held = shutdown
+
+# 9. Reading Multiple Inputs (DIP Switch)
+dip_switches = [Button(2), Button(3), Button(4)]
+vals = [b.is_pressed for b in dip_switches] 
+# Result: [True, False, True]
+
+# 10. Controlling a Motor (Simple H-Bridge)
+motor = Motor(forward=17, backward=18)
+motor.forward(speed=0.5)
+motor.stop()
+
+
+# ==============================================================================
+# SECTION 2: UART (pyserial) - Examples 11-20
+# Note: Ensure /dev/ttyAMA0 enabled in config.txt
+# ==============================================================================
+
+# 11. Open Serial Port
+# timeout=1 prevents hanging
+ser = serial.Serial('/dev/ttyAMA0', 9600, timeout=1) 
+
+# 12. Send String (Encoding)
+msg = "Heartbeat\n"
+ser.write(msg.encode('utf-8'))
+
+# 13. Send Raw Binary (Hex)
+ser.write(b'\xAA\xFF\x01')
+
+# 14. Read Line (Blocking until \n)
+if ser.in_waiting > 0:
+    line = ser.readline().decode('utf-8').strip()
+
+# 15. Non-Blocking Read Check
+if ser.in_waiting >= 4: # Wait for header
+    data = ser.read(4)
+
+# 16. Flush Buffers (Clear Junk)
+ser.reset_input_buffer()
+ser.reset_output_buffer()
+
+# 17. Parsing CSV Data ("23.5, 1012, 45")
+line = "23.5, 1012, 45" # Example
+try:
+    temp, pressure, hum = map(float, line.split(','))
+except ValueError:
+    pass
+
+# 18. Changing Baud Rate on the Fly
+ser.baudrate = 115200
+
+# 19. Binary Parsing (struct)
+# Unpack Little Endian Float from 4 bytes
+raw_bytes = b'\x00\x00\x80\x3F' # 1.0
+if len(raw_bytes) == 4:
+    val = struct.unpack('<f', raw_bytes)[0]
+
+# 20. Hex Dump Debugging
+# print(" ".join([hex(b) for b in raw_bytes]))
+
+
+# ==============================================================================
+# SECTION 3: PRECISE TIMING & LOOPS - Examples 21-30
+# ==============================================================================
+
+# 21. Blink Without Delay (Non-Blocking)
+last_toggle = 0
+if time.monotonic() - last_toggle > 1.0:
+    led.toggle()
+    last_toggle = time.monotonic()
+
+# 22. Fixed 100Hz Loop (PID Pattern)
+target_interval = 0.01 
+next_run = time.monotonic()
+# In loop:
+# if time.monotonic() >= next_run:
+#     do_task()
+#     next_run += target_interval
+
+# 23. Timeout Logic (Watchdog)
+start_time = time.monotonic()
+# while not btn.is_pressed:
+#     if time.monotonic() - start_time > 5.0: break
+
+# 24. Measuring Execution Time
+t1 = time.monotonic()
+# task()
+t2 = time.monotonic()
+print(f"Task took {(t2-t1)*1000:.2f} ms")
+
+# 25. Rate Limiter (Log Throttling)
+last_log = 0
+def log_warning(msg):
+    global last_log
+    if time.monotonic() - last_log > 1.0:
+        print(msg)
+        last_log = time.monotonic()
+
+# 26. Frequency Counter
+# count pulses in 1 sec window...
+
+# 27. Precise Delay (Busy Wait)
+# target = time.monotonic() + 0.0005
+# while time.monotonic() < target: pass 
+
+# 28. Multi-Tasking Scheduler
+# if now - task_a > 0.1: fast_task()
+# if now - task_b > 1.0: slow_task()
+
+# 29. Debounce Timer (Software)
+last_press = 0
+if btn.is_pressed:
+    if time.monotonic() - last_press > 0.05:
+        # Valid press
+        last_press = time.monotonic()
+
+# 30. Drift Correction Loop
+# sleep_time = target - now
+# if sleep_time > 0: time.sleep(sleep_time)
+
+
+# ==============================================================================
+# SECTION 4: I2C & SENSORS (smbus2) - Examples 31-40
+# ==============================================================================
+
+# 31. Initialize I2C Bus
+bus = SMBus(1)
+
+# 32. Scan for I2C Devices
+# Try read_byte(addr) in range(0x03, 0x77)...
+
+# 33. Write Single Register
+DEVICE_ADDR = 0x6A
+bus.write_byte_data(DEVICE_ADDR, 0x10, 0x60)
+
+# 34. Read Single Register
+val = bus.read_byte_data(DEVICE_ADDR, 0x0F)
+
+# 35. Burst Read
+data = bus.read_i2c_block_data(DEVICE_ADDR, 0x28, 6)
+
+# 36. Convert Bytes to Int16
+raw_x = data[0] | (data[1] << 8)
+if raw_x > 32767: raw_x -= 65536
+
+# 37. Bitwise Masking
+if val & 0b00000001: print("Bit 0 Set")
+
+# 38. Writing 16-bit Value
+val = 1234
+bytes_to_write = [val & 0xFF, (val >> 8) & 0xFF]
+bus.write_i2c_block_data(DEVICE_ADDR, 0x20, bytes_to_write)
+
+# 39. Error Handling
+try:
+    bus.read_byte_data(DEVICE_ADDR, 0x00)
+except OSError:
+    print("I2C Error")
+
+# 40. Context Manager
+with SMBus(1) as bus:
+    pass # auto close
+
+
+# ==============================================================================
+# SECTION 5: SYSTEM MONITORING - Examples 41-50
+# ==============================================================================
+
+# 41. Get CPU Temp
+cpu = CPUTemperature()
+# print(cpu.temperature)
+
+# 42. Check Disk Space
+total, used, free = shutil.disk_usage("/")
+if (free / total) < 0.05: print("Disk Full")
+
+# 43. Get IP Address
+def get_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except: return "127.0.0.1"
+
+# 44. Check Service Status
+# subprocess.check_output(["pgrep", "node-red"])
+
+# 45. Soft Reboot
+# os.system("sudo reboot")
+
+# 46. Detect Under-Voltage
+# out = subprocess.check_output(["vcgencmd", "get_throttled"])
+# if "0x50000" in out.decode(): print("Low Voltage")
+
+# 47. Uptime Check
+# read /proc/uptime
+
+# 48. Run Shell Command
+res = subprocess.run(['ls', '-l'], capture_output=True, text=True)
+
+# 49. Check Internet
+# socket.create_connection(("google.com", 80), timeout=2)
+
+# 50. Self Destruct
+# sys.exit("Error")
+
+
+# ==============================================================================
+# SECTION 6: MULTITHREADING - Examples 51-60
+# ==============================================================================
+
+# 51. Basic Threading
+def worker(): time.sleep(1)
+t = threading.Thread(target=worker, daemon=True)
+t.start()
+
+# 52. Thread Locks
+data_lock = threading.Lock()
+# with data_lock: shared_data += 1
+
+# 53. Multiprocessing (CPU cores)
+# p = Process(target=heavy_math)
+# p.start()
+
+# 54. Queue (Process Safe)
+q = Queue()
+# q.put("msg")
+
+# 55. Stop Event
+stop_event = threading.Event()
+# while not stop_event.is_set(): ...
+
+# 56. Thread Timer
+# threading.Timer(5.0, task).start()
+
+# 57. Thread Pool
+# with ThreadPoolExecutor(max_workers=4) as ex: ...
+
+# 58. Subprocess Script
+# subprocess.Popen(["python3", "slave.py"])
+
+# 59. CPU Priority
+os.nice(-10)
+
+# 60. CPU Affinity
+os.sched_setaffinity(0, {3}) # Pin to Core 3
+
+
+# ==============================================================================
+# SECTION 7: NETWORKING - Examples 61-70
+# ==============================================================================
+
+# 61. UDP Sender
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.sendto(b"Hello", ("192.168.1.50", 5005))
+
+# 62. UDP Receiver
+sock.bind(("0.0.0.0", 5005))
+sock.setblocking(False)
+
+# 63. TCP Client
+# s.connect(("ip", 8080)); s.sendall(b"Data")
+
+# 64. Web Server (Flask) - See Flask docs
+
+# 65. MQTT Publisher
+# client.connect("broker", 1883); client.publish("topic", "msg")
+
+# 66. JSON Send
+# sock.sendto(json.dumps(dict).encode(), target)
+
+# 67. JSON Receive
+# packet = json.loads(data.decode())
+
+# 68. WiFi RSSI
+# Read /proc/net/wireless
+
+# 69. Static IP Assign
+# os.system("sudo ip addr add ...")
+
+# 70. WebSocket (requires 'websockets' lib)
+
+
+# ==============================================================================
+# SECTION 8: FILE I/O - Examples 71-80
+# ==============================================================================
+
+# 71. Append CSV
+with open('log.csv', 'a', newline='') as f:
+    csv.writer(f).writerow([time.time(), 123])
+
+# 72. Rotating Logs
+# handler = RotatingFileHandler("app.log", maxBytes=1M, backupCount=3)
+
+# 73. Binary Logging (Fast)
+packed = struct.pack('fii', time.time(), 1024, 500)
+with open('data.bin', 'ab') as f: f.write(packed)
+
+# 74. Config Parser
+config = configparser.ConfigParser()
+config.read('settings.ini')
+# val = config['SECTION']['key']
+
+# 75. Atomic Write
+with open('temp', 'w') as f: f.write("Data")
+os.rename('temp', 'final')
+
+# 76. Pathlib
+folder = Path("/home/pi/logs")
+folder.mkdir(parents=True, exist_ok=True)
+
+# 77. Auto-increment Filename
+# check os.path.exists in loop...
+
+# 78. Flush to Disk
+# f.flush(); os.fsync(f.fileno())
+
+# 79. Read Last Line (Seek)
+# f.seek(-2, os.SEEK_END)...
+
+# 80. Delete Old Files
+# if os.stat(f).st_mtime < limit: os.remove(f)
+
+
+# ==============================================================================
+# SECTION 9: ADVANCED PATTERNS - Examples 81-100
+# ==============================================================================
+
+# 81. Auto-Reconnecting Serial (Robustness)
+def get_serial():
+    while True:
+        try:
+            return serial.Serial('/dev/ttyAMA0', 9600)
+        except:
+            time.sleep(2)
+
+# 82. Packet Validator (Checksum)
+def validate(pkt):
+    # Split, calculate XOR checksum, compare
+    return True
+
+# 83. Ring Buffer Parser
+buffer = ""
+def parse_stream(chunk):
+    global buffer
+    buffer += chunk
+    if '\n' in buffer:
+        line, buffer = buffer.split('\n', 1)
+        return line
+
+# 84. Async Threaded Logger (Queue Pattern)
+# log_queue = queue.Queue()
+# Worker thread reads queue and writes to disk.
+# Main thread puts data into queue (Instant).
+
+# 85. Disk Space Watchdog
+def check_disk():
+    # Stop logging if free space < 500MB
+    pass
+
+# 86. Atomic Config Loader (Safe JSON)
+def load_json():
+    try: return json.load(open("conf.json"))
+    except: return {} # Defaults
+
+# 87. Thermal Throttle Monitor
+# Check temp + vcgencmd get_throttled flags
+
+# 88. Graceful Exit (Signal Handler)
+def on_exit(sig, frame):
+    # stop_motors(); sys.exit(0)
+signal.signal(signal.SIGINT, on_exit)
+
+# 89. Hardware Watchdog Kicker
+# wd = open('/dev/watchdog', 'w'); wd.write('1')
+
+# 90. Drift-Free Loop Class
+class RateLimiter:
+    def __init__(self, hz):
+        self.period = 1.0/hz
+        self.next = time.monotonic()
+    def sleep(self):
+        now = time.monotonic()
+        sleep = self.next - now
+        if sleep > 0: time.sleep(sleep); self.next += self.period
+        else: self.next = now + self.period
+
+# 91. FSM Skeleton
+# State IDLE -> ARMED -> RUNNING based on events
+
+# 92. Low Pass Filter
+# val = (alpha * new) + ((1-alpha) * old)
+
+# 93. Non-Blocking Blink
+# Toggle LED if time - last > interval (inside loop)
+
+# 94. UDP Telemetry Packer (Struct)
+# payload = struct.pack('<ffff', p, r, y, bat)
+# sock.sendto(payload, ip)
+
+# 95. WiFi RSSI Checker
+# Read /proc/net/wireless level
+
+# 96. Systemd Notify
+# import sdnotify; n = sdnotify.SystemdNotifier(); n.notify("WATCHDOG=1")
+
+# 97. Soft-PWM Fan
+# fan = PWMOutputDevice(27, frequency=100); fan.value = 0.5
+
+# 98. Safe Relay Toggle (Anti-Chatter)
+# Only toggle if time - last > 2.0s
+
+# 99. Read CPU Serial (Unique ID)
+# Parse /proc/cpuinfo for Serial
+
+# 100. Master Loop Skeleton
+# setup(); while True: inputs(); logic(); outputs(); sleep()
