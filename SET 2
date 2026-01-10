@@ -1,0 +1,432 @@
+# ==============================================================================
+# RASPBERRY PI 5 FIELD MANUAL - PART 2: PSEUDO-RTOS & ADVANCED COMMS (101-140)
+# Focus: Fixed Frequency Loops, Bi-Directional UART, State Machines
+# ==============================================================================
+
+import time
+import struct
+import serial
+import threading
+import queue
+from collections import deque
+
+# ==============================================================================
+# SECTION 10: PSEUDO-RTOS SCHEDULERS (101-110)
+# Goal: Run tasks at fixed rates (100Hz, 10Hz, 1Hz) without drift.
+# ==============================================================================
+
+# 101. The "Super Loop" Scheduler (Basic)
+# A single loop that divides time slots based on modulo math.
+# Simple, but can jitter if one task takes too long.
+tick = 0
+while True:
+    start = time.monotonic()
+    
+    # 100Hz Task (Every tick)
+    read_imu()
+    
+    # 10Hz Task (Every 10th tick)
+    if tick % 10 == 0:
+        update_pid_gains()
+        
+    # 1Hz Task (Every 100th tick)
+    if tick % 100 == 0:
+        blink_status_led()
+        tick = 0 # Reset to prevent overflow (optional in Py, good for C++)
+    
+    tick += 1
+    # Sleep remaining time for 100Hz (0.01s)
+    time.sleep(max(0, 0.01 - (time.monotonic() - start)))
+
+# 102. The "Priority Class" Scheduler (Object-Oriented)
+# Better for managing complex systems.
+class Task:
+    def __init__(self, interval_ms, func):
+        self.interval = interval_ms / 1000.0
+        self.func = func
+        self.next_run = 0
+
+tasks = [
+    Task(10,  read_imu),       # 100Hz
+    Task(100, update_telemetry), # 10Hz
+    Task(1000, check_battery)    # 1Hz
+]
+
+while True:
+    now = time.monotonic()
+    for t in tasks:
+        if now >= t.next_run:
+            t.func()
+            t.next_run = now + t.interval
+    time.sleep(0.001) # Short sleep to prevent 100% CPU usage
+
+# 103. The "Time-Sliced" Scheduler (Yielding)
+# Uses Python generators to pause long tasks.
+def long_calibration_task():
+    for i in range(100):
+        # Do 1% of work
+        calibrate_sensor_step(i)
+        yield # Pause and let main loop run
+    print("Calib Done")
+
+calib_gen = long_calibration_task()
+
+# In Main Loop:
+# try:
+#     next(calib_gen) # Runs only one step per loop cycle
+# except StopIteration:
+#     pass
+
+# 104. Drift Compensation (Integral Term)
+# Corrects accumulated timing error over hours.
+target_dt = 0.01
+error_accum = 0
+last_time = time.monotonic()
+
+while True:
+    now = time.monotonic()
+    dt = now - last_time
+    last_time = now
+    
+    error_accum += (target_dt - dt)
+    
+    # Run Physics/Control
+    
+    # Sleep corrected amount
+    sleep_time = target_dt + error_accum
+    if sleep_time > 0: time.sleep(sleep_time)
+
+# 105. CPU Isolation (Pinning to Core 3)
+# Keeps your control loop away from OS noise.
+import os
+def run_realtime_task():
+    # Force this process to run ONLY on CPU Core 3
+    os.sched_setaffinity(0, {3}) 
+    while True:
+        # High priority loop
+        pass
+
+# 106. The "Watchdog" Task
+# A software task that monitors other tasks.
+last_heartbeat = time.time()
+
+def critical_thread():
+    global last_heartbeat
+    while True:
+        do_work()
+        last_heartbeat = time.time()
+
+# In Monitor Thread:
+# if time.time() - last_heartbeat > 0.5:
+#     print("CRITICAL STALL DETECTED")
+#     reset_system()
+
+# 107. High-Resolution Timer (Perf_Counter)
+# monotonic() is good, perf_counter() is higher resolution (includes sleep time).
+start = time.perf_counter()
+# ... op ...
+duration = time.perf_counter() - start
+
+# 108. The "Decoupled" Input/Output
+# Run I/O fast, Logic slow (or vice-versa).
+# Input Thread -> Shared State -> Logic Thread -> Shared State -> Output Thread
+
+# 109. Garbage Collection Control
+# Python's GC causes random 10ms freezes. Disable it during flight.
+import gc
+def arm_drone():
+    gc.disable() # Stop automatic cleanup
+    print("GC Disabled for Flight")
+
+def disarm_drone():
+    gc.enable()
+    gc.collect() # Clean up now while safe
+    print("GC Re-enabled")
+
+# 110. Real-Time Priority (Nice Level)
+# Request higher scheduling priority from Linux kernel.
+os.nice(-20) # Highest priority (requires sudo)
+
+
+# ==============================================================================
+# SECTION 11: ROBUST 2-WAY UART (111-120)
+# Focus: Reliable Command & Response (Pi <-> RP2040/VFD)
+# ==============================================================================
+
+# 111. The "Command-Response" Pattern (Blocking)
+# Send command, wait for specific ACK.
+def send_command_sync(cmd):
+    ser.write(f"{cmd}\n".encode())
+    start = time.time()
+    while time.time() - start < 1.0: # 1s Timeout
+        if ser.in_waiting:
+            resp = ser.readline().decode().strip()
+            if resp == "ACK": return True
+            if resp == "NACK": return False
+    return False # Timeout
+
+# 112. The "Async Dispatcher" (Non-Blocking)
+# Read UART continuously, trigger callback when full cmd received.
+def handle_rx():
+    while ser.in_waiting:
+        line = ser.readline().decode().strip()
+        if line.startswith("GET_TELEM"): send_telemetry()
+        elif line.startswith("SET_PID"): update_pid(line)
+
+# 113. Binary Packet Structure (Header/Footer)
+# Robust against noise. Structure: [0xAA, 0x55, LEN, DATA..., CS]
+def send_binary_packet(data_bytes):
+    header = b'\xAA\x55'
+    length = bytes([len(data_bytes)])
+    checksum = bytes([sum(data_bytes) % 256])
+    packet = header + length + data_bytes + checksum
+    ser.write(packet)
+
+# 114. Circular Buffer Implementation (deque)
+# Good for keeping history of last N serial messages.
+rx_history = deque(maxlen=50) # Keeps last 50 lines
+def log_rx(line):
+    rx_history.append(line)
+    # If crash, dump(rx_history) to file
+
+# 115. Variable Argument Parser
+# Handle: "SET_POS 10 20" vs "SET_POS 10"
+def parse_cmd(line):
+    parts = line.split()
+    cmd = parts[0]
+    args = [float(x) for x in parts[1:]] # Auto-convert rest to floats
+    return cmd, args
+
+# 116. The "Back-Off" Retrier
+# If send fails, wait longer each time.
+def send_with_retry(msg):
+    delay = 0.1
+    for _ in range(3):
+        ser.write(msg)
+        if wait_for_ack(): return True
+        time.sleep(delay)
+        delay *= 2 # Exponential backoff
+    return False
+
+# 117. Clear-to-Send (Flow Control) Logic
+# Don't flood the RP2040 buffer.
+def safe_send(msg):
+    # Only send if we haven't sent too much recently
+    # (Software flow control)
+    time.sleep(0.01) # Tiny gap between packets
+    ser.write(msg)
+
+# 118. RS485 Direction Control (GPIO)
+# If using a raw RS485 chip (MAX485), you must toggle DE/RE pin.
+de_pin = OutputDevice(4)
+def rs485_write(msg):
+    de_pin.on()   # TX Mode
+    ser.write(msg)
+    ser.flush()   # Wait for all bits to leave
+    de_pin.off()  # RX Mode
+
+# 119. Handling "Framing Errors" (Junk Data)
+# If we get garbage, flush buffer to resync.
+try:
+    line = ser.readline().decode()
+except UnicodeDecodeError:
+    print("Noise detected, flushing...")
+    ser.reset_input_buffer()
+
+# 120. Multi-Port Manager (Class)
+# Manage VFD (ttyUSB0) and Telemetry (ttyAMA0) in one object.
+class CommsManager:
+    def __init__(self):
+        self.vfd = serial.Serial('/dev/ttyUSB0', 9600)
+        self.telem = serial.Serial('/dev/ttyAMA0', 57600)
+    
+    def update(self):
+        # Service both ports
+        self.check_vfd()
+        self.check_telem()
+
+
+# ==============================================================================
+# SECTION 12: STATE MACHINES & LOGIC (121-130)
+# Goal: Deterministic behavior (Init -> Idle -> Run -> Error)
+# ==============================================================================
+
+# 121. Enum-Based State Machine (Clean)
+class State:
+    BOOT = 0
+    IDLE = 1
+    ARMING = 2
+    FLYING = 3
+    ERROR = 4
+
+state = State.BOOT
+
+# 122. Transition Logic (The "Switch")
+def update_state_machine():
+    global state
+    
+    if state == State.BOOT:
+        if sensors_ready: state = State.IDLE
+        
+    elif state == State.IDLE:
+        if switch_armed: state = State.ARMING
+        
+    elif state == State.ARMING:
+        if throttle > 10: state = State.FLYING
+        
+    # Always check for global abort
+    if emergency_switch: state = State.ERROR
+
+# 123. Entry/Exit Actions
+# Run code only ONCE when entering a state.
+current_state = 0
+last_state = 0
+
+def run_fsm():
+    global last_state
+    if current_state != last_state:
+        # ON ENTRY logic
+        if current_state == State.FLYING: start_logging()
+        if current_state == State.IDLE: stop_motors()
+        last_state = current_state
+
+# 124. Timeout State (Stuck detection)
+# If staying in ARMING > 5 seconds, go back to IDLE.
+state_start_time = time.time()
+
+if current_state == State.ARMING:
+    if time.time() - state_start_time > 5.0:
+        print("Arming Timed Out")
+        state = State.IDLE
+
+# 125. The "Safety Interlock" Check
+# Function that returns True only if ALL conditions met.
+def is_safe_to_arm():
+    return (
+        gps_fix == True and
+        battery_voltage > 11.0 and
+        remote_connected == True and
+        throttle_value == 0
+    )
+
+# 126. Hysteresis (Debouncing thresholds)
+# Prevents flickering between states if sensor is noisy.
+# e.g., Low Batt trigger at 10.0V, Recovery at 10.5V
+def check_battery_state(voltage):
+    if state == "NORMAL" and voltage < 10.0:
+        return "LOW_BATT"
+    if state == "LOW_BATT" and voltage > 10.5:
+        return "NORMAL"
+    return state # No change
+
+# 127. Error Code Bitmask
+# Store multiple errors in one integer.
+ERR_NONE = 0
+ERR_IMU  = 1  # 0001
+ERR_GPS  = 2  # 0010
+ERR_BAT  = 4  # 0100
+
+system_health = ERR_NONE
+# Add error: system_health |= ERR_IMU
+# Check error: if system_health & ERR_IMU: ...
+
+# 128. Mode Switching (Manual vs Auto)
+mode = "MANUAL"
+def compute_output():
+    if mode == "MANUAL":
+        return read_rc_input()
+    elif mode == "AUTO":
+        return run_autopilot_pid()
+
+# 129. Parameter Reloading
+# Allow state machine to reload config without reboot.
+if rx_command == "RELOAD_CONFIG":
+    pause_control_loop()
+    load_json_config()
+    resume_control_loop()
+
+# 130. The "Panic" State (Latch)
+# Once entered, can only exit via hard reboot.
+if state == State.PANIC:
+    deploy_parachute()
+    beep_loudly()
+    # No way to set state = IDLE here. Safety latch.
+
+
+# ==============================================================================
+# SECTION 13: PRACTICAL INTEGRATION (131-140)
+# Focus: Logging, IPC, and making it survive the real world.
+# ==============================================================================
+
+# 131. Shared Memory (Value)
+# Fastest way to share a single float between processes.
+from multiprocessing import Value
+shared_throttle = Value('d', 0.0) # 'd' = double (float)
+# p1: shared_throttle.value = 0.5
+# p2: print(shared_throttle.value)
+
+# 132. Named Pipe (FIFO)
+# Good for sending commands from Shell to Python script.
+pipe_path = "/tmp/my_pipe"
+# os.mkfifo(pipe_path)
+# Open like a file to read commands sent via 'echo "CMD" > /tmp/my_pipe'
+
+# 133. Memory-Mapped File (mmap)
+# Zero-copy sharing of complex data structures (C++ speed).
+import mmap
+# (Requires setting up a fixed size file first)
+
+# 134. Structured Logging (JSON Lines)
+# Better than CSV for debugging mixed data types.
+import json
+def log_event(event_type, details):
+    entry = {"t": time.time(), "evt": event_type, "data": details}
+    log_file.write(json.dumps(entry) + "\n")
+
+# 135. Automatic Log Rotation (Startup)
+# Renames 'latest.log' to 'prev.log' on boot.
+if os.path.exists("latest.log"):
+    os.rename("latest.log", f"log_{int(time.time())}.backup")
+
+# 136. The "Blink Codes" Debugger
+# No screen? Blink LED to show error code.
+def blink_error(code):
+    for _ in range(code):
+        led.on(); time.sleep(0.2)
+        led.off(); time.sleep(0.2)
+    time.sleep(1.0) # Pause before repeating
+
+# 137. Simulation Mode (Mock Hardware)
+# Test logic on your laptop without the Pi.
+try:
+    import gpiozero
+except ImportError:
+    # We are on laptop, create Mock classes
+    class LED: 
+        def on(self): print("Mock LED ON")
+    print("RUNNING IN SIMULATION MODE")
+
+# 138. PID Class (Reusable)
+class PID:
+    def __init__(self, kp, ki, kd):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.integral = 0
+        self.prev_error = 0
+    
+    def update(self, error, dt):
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt
+        self.prev_error = error
+        return (self.kp*error) + (self.ki*self.integral) + (self.kd*derivative)
+
+# 139. Voltage Scaling (ADC)
+# Convert raw 0-3.3V reading to Battery Voltage.
+# V_real = V_adc * (R1 + R2) / R2
+adc_val = 0.5 # Volts read at pin
+R1, R2 = 10000, 2000 # Voltage divider resistors
+batt_voltage = adc_val * ((R1 + R2) / R2)
+
+# 140. Graceful Shutdown Button
+# Safe shutdown for headless Pi.
+shut_btn = Button(21, hold_time=3)
+shut_btn.when_held = lambda: os.system("sudo shutdown -h now")
