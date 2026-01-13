@@ -1,0 +1,49 @@
+from gpiozero import Button, DigitalOutputDevice
+from signal import pause
+
+# --- Configuration ---
+PIN_BTN_1 = 17
+PIN_BTN_2 = 27
+PIN_BTN_3 = 22
+PIN_OUT   = 23
+
+# --- Setup ---
+
+# 1. Output (Generic)
+# active_high=True: 1 = 3.3V, 0 = GND
+output_signal = DigitalOutputDevice(PIN_OUT, active_high=True, initial_value=False)
+
+# 2. Inputs (3 Buttons)
+# bounce_time=0.25: Ignores extra signals for 0.25s after press
+btn1 = Button(PIN_BTN_1, pull_up=True, bounce_time=0.25)
+btn2 = Button(PIN_BTN_2, pull_up=True, bounce_time=0.25)
+btn3 = Button(PIN_BTN_3, pull_up=True, bounce_time=0.25)
+
+print("--- System Ready ---")
+
+# --- Simple Interrupt Functions ---
+# Each button gets its own specific function. No arguments needed.
+
+def press_one():
+    print("[Interrupt] Button 1 Pressed -> Turning Output ON")
+    output_signal.on()
+
+def press_two():
+    print("[Interrupt] Button 2 Pressed -> Turning Output OFF")
+    output_signal.off()
+
+def press_three():
+    print("[Interrupt] Button 3 Pressed -> Toggling Output")
+    output_signal.toggle()
+
+# --- Attach Interrupts ---
+# Direct mapping: Button X -> Function X
+btn1.when_pressed = press_one
+btn2.when_pressed = press_two
+btn3.when_pressed = press_three
+
+# --- Keep Alive ---
+try:
+    pause()
+except KeyboardInterrupt:
+    print("\nExiting...")
