@@ -1,0 +1,31 @@
+import time
+import multiprocessing
+
+def heavy_load():
+    """A task that just spins the CPU endlessly."""
+    while True:
+        # Performing a useless calculation keeps the CPU busier than 'pass'
+        _ = 21341 * 21341 
+
+if __name__ == '__main__':
+    print("Starting 4 processes to load all cores...")
+    
+    # Create a list to hold our processes
+    processes = []
+    
+    # Spawn 4 processes (one for each core on a standard Pi)
+    for _ in range(4):
+        p = multiprocessing.Process(target=heavy_load)
+        p.start()
+        processes.append(p)
+        print(f"Core process {_ + 1} started")
+
+    try:
+        # Keep the main script alive while workers work
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        # Clean up processes on Ctrl+C so you don't leave zombies
+        print("\nStopping all cores...")
+        for p in processes:
+            p.terminate()
